@@ -1,0 +1,83 @@
+# Build log4j 1.2.17 with Maven and run its Ant-driven regression suite.
+# Upstream (Apache SVN, 2012) has no GitHub Actions CI; this workflow mirrors the
+# release build: `mvn verify` compiles for -source/-target 1.4, the antrun
+# `runAll` execution in the test phase runs tests/build.xml's regression suite,
+# and the bundle plugin packages target/log4j-1.2.17.jar.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "tests/build.xml target to run instead of runAll (e.g. Core, SocketServer); empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # The release was compiled for Java 1.4 (built on JDK 1.6). JDK 7 still
+      # compiles -source 1.4 and runs Maven 3.6; setup-java no longer lists
+      # Zulu 7, so fetch the last Zulu 7 build from Azul's CDN directly.
+      - name: Set up JDK 7
+        run: |
+          curl -fsSL https://cdn.azul.com/zulu/bin/zulu7.56.0.11-ca-jdk7.0.352-linux_x64.tar.gz | tar -xz -C "$RUNNER_TEMP"
+          JDK="$RUNNER_TEMP/zulu7.56.0.11-ca-jdk7.0.352-linux_x64"
+          echo "JAVA_HOME=$JDK" >> "$GITHUB_ENV"
+          echo "$JDK/bin" >> "$GITHUB_PATH"
+
+      # Maven 3.9 (runner default) needs Java 8; 3.6.3 is the last line running on Java 7.
+      - name: Install Maven 3.6.3
+        run: |
+          curl -fsSL https://archive.apache.org/dist/maven/maven-3/3.6.3/binaries/apache-maven-3.6.3-bin.tar.gz | tar -xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/apache-maven-3.6.3/bin" >> "$GITHUB_PATH"
+
+      # The pom declares the defunct http://download.java.net/maven/2/ repository;
+      # route it to Maven Central so resolution does not stall on it.
+      - name: Configure Maven settings
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml <<'EOF'
+          <settings>
+            <mirrors>
+              <mirror>
+                <id>central-for-java-net</id>
+                <mirrorOf>maven2-repository.dev.java.net</mirrorOf>
+                <url>https://repo.maven.apache.org/maven2</url>
+              </mirror>
+            </mirrors>
+          </settings>
+          EOF
+
+      - name: Build and test
+        env:
+          MAVEN_OPTS: -Dhttps.protocols=TLSv1.2 -Xmx1g
+        run: |
+          set -o pipefail
+          java -version
+          mvn -v
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            mvn -B -e clean verify -Dmaven.site.skip=true -Dlog4j.tests.target=${{ inputs.test-filter }} 2>&1 | tee build.log
+          else
+            mvn -B -e clean verify -Dmaven.site.skip=true 2>&1 | tee build.log
+          fi
+
+      - name: Test summary
+        run: |
+          grep -E '^\s*\[junit\] (Running|Tests run:)' build.log
+          # printsummary and the plain formatter both print a "Tests run:" line per
+          # suite; count only the one that directly follows "Running <suite>".
+          awk '/\[junit\] Tests run:/ && prev ~ /\[junit\] Running / { gsub(",", ""); for (i=1;i<=NF;i++) { if ($i=="run:") r+=$(i+1); if ($i=="Failures:") f+=$(i+1); if ($i=="Errors:") e+=$(i+1) } s++ }
+               { prev = $0 }
+               END { printf "TOTAL: %d test suites, %d tests run, %d failures, %d errors, %d passed\n", s, r, f, e, r-f-e }' build.log
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: log4j-jar
+          path: target/log4j-1.2.17.jar
+          if-no-files-found: error
